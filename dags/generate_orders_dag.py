@@ -58,9 +58,8 @@ def create_orders_table(connection):
 
 
 def generate_random_order(batch_id, now):
-    seven_days_ago = now - timedelta(days=7)
     random_seconds = random.randint(0, 7 * 24 * 60 * 60)
-    order_date = seven_days_ago + timedelta(seconds=random_seconds)
+    order_date = now - timedelta(seconds=random_seconds)
 
     amount_cents = random.randint(100, 1_000_000)
     amount = Decimal(amount_cents) / Decimal("100")
