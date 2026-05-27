@@ -1,69 +1,63 @@
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 
 import pendulum
-import psycopg2
 from psycopg2.extras import execute_values
 
 from airflow.decorators import dag, task
 
-from common.exchange_rates import fetch_latest_rates, convert_amount_to_eur
+from common.constants import INSERT_PAGE_SIZE, SYNC_CHUNK_SIZE, SYNC_STATE_NAME
+from common.db import get_source_connection, get_target_connection
+from common.exchange_rates import convert_amount_to_eur, fetch_latest_rates
+from common.schemas import (
+    create_orders_eur_table,
+    create_orders_table,
+    create_sync_state_table,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
-def get_postgres_1_connection():
-    return psycopg2.connect(
-        host=os.environ["POSTGRES_1_HOST"],
-        port=int(os.environ["POSTGRES_1_PORT"]),
-        dbname=os.environ["POSTGRES_1_DB"],
-        user=os.environ["POSTGRES_1_USER"],
-        password=os.environ["POSTGRES_1_PASSWORD"],
-    )
-
-
-def get_postgres_2_connection():
-    return psycopg2.connect(
-        host=os.environ["POSTGRES_2_HOST"],
-        port=int(os.environ["POSTGRES_2_PORT"]),
-        dbname=os.environ["POSTGRES_2_DB"],
-        user=os.environ["POSTGRES_2_USER"],
-        password=os.environ["POSTGRES_2_PASSWORD"],
-    )
-
-
-def create_orders_eur_table(connection):
-    create_table_sql = """
-        CREATE TABLE IF NOT EXISTS orders_eur (
-            order_id UUID PRIMARY KEY,
-            customer_email TEXT NOT NULL,
-            order_date TIMESTAMP NOT NULL,
-
-            original_amount NUMERIC(12, 2) NOT NULL,
-            original_currency TEXT NOT NULL,
-
-            amount_eur NUMERIC(12, 2) NOT NULL,
-            exchange_rate_to_eur NUMERIC(18, 8) NOT NULL,
-
-            source_created_at TIMESTAMP NOT NULL,
-            processed_at TIMESTAMP NOT NULL DEFAULT now()
-        );
-    """
-
+def get_sync_state(connection):
     with connection.cursor() as cursor:
-        cursor.execute(create_table_sql)
+        cursor.execute(
+            """
+            SELECT last_created_at, last_order_id
+            FROM sync_state
+            WHERE name = %s;
+            """,
+            (SYNC_STATE_NAME,),
+        )
+        row = cursor.fetchone()
+
+    if row is None:
+        return None, None
+
+    return row
 
 
-def get_last_processed_source_created_at(connection):
+def update_sync_state(connection, last_created_at, last_order_id):
     with connection.cursor() as cursor:
-        cursor.execute("SELECT MAX(source_created_at) FROM orders_eur;")
-        return cursor.fetchone()[0]
+        cursor.execute(
+            """
+            INSERT INTO sync_state (
+                name,
+                last_created_at,
+                last_order_id
+            )
+            VALUES (%s, %s, %s)
+            ON CONFLICT (name) DO UPDATE SET
+                last_created_at = EXCLUDED.last_created_at,
+                last_order_id = EXCLUDED.last_order_id,
+                updated_at = now();
+            """,
+            (SYNC_STATE_NAME, last_created_at, last_order_id),
+        )
 
 
-def fetch_source_orders(connection, last_processed_source_created_at):
-    if last_processed_source_created_at is None:
+def fetch_source_orders_chunk(connection, last_created_at, last_order_id, limit):
+    if last_created_at is None and last_order_id is None:
         query = """
             SELECT
                 order_id,
@@ -73,9 +67,10 @@ def fetch_source_orders(connection, last_processed_source_created_at):
                 currency,
                 created_at
             FROM orders
-            ORDER BY created_at ASC;
+            ORDER BY created_at ASC, order_id ASC
+            LIMIT %s;
         """
-        params = ()
+        params = (limit,)
     else:
         query = """
             SELECT
@@ -86,10 +81,11 @@ def fetch_source_orders(connection, last_processed_source_created_at):
                 currency,
                 created_at
             FROM orders
-            WHERE created_at >= %s
-            ORDER BY created_at ASC;
+            WHERE (created_at, order_id) > (%s, %s)
+            ORDER BY created_at ASC, order_id ASC
+            LIMIT %s;
         """
-        params = (last_processed_source_created_at,)
+        params = (last_created_at, last_order_id, limit)
 
     with connection.cursor() as cursor:
         cursor.execute(query, params)
@@ -156,7 +152,7 @@ def insert_converted_orders(connection, converted_rows):
             cursor,
             insert_sql,
             converted_rows,
-            page_size=1000,
+            page_size=INSERT_PAGE_SIZE,
             fetch=True,
         )
 
@@ -170,6 +166,7 @@ def insert_converted_orders(connection, converted_rows):
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
     tags=["orders", "sync", "eur", "postgres"],
+    max_active_runs=1,
     default_args={
         "retries": 2,
         "retry_delay": timedelta(minutes=2),
@@ -185,77 +182,107 @@ def sync_orders_to_eur_dag():
             "Starting orders sync: source=postgres-1.orders target=postgres-2.orders_eur"
         )
 
-        source_connection = get_postgres_1_connection()
-        target_connection = get_postgres_2_connection()
+        source_connection = get_source_connection()
+        target_connection = get_target_connection()
 
         try:
+            create_orders_table(source_connection)
+            source_connection.commit()
+
             create_orders_eur_table(target_connection)
+            create_sync_state_table(target_connection)
             target_connection.commit()
 
-            last_processed_source_created_at = get_last_processed_source_created_at(
-                target_connection
-            )
+            last_created_at, last_order_id = get_sync_state(target_connection)
 
             logger.info(
-                "Last processed source_created_at=%s",
-                last_processed_source_created_at,
+                "Current sync state: last_created_at=%s last_order_id=%s",
+                last_created_at,
+                last_order_id,
             )
 
-            source_orders = fetch_source_orders(
-                source_connection,
-                last_processed_source_created_at,
-            )
+            total_fetched_rows = 0
+            total_converted_rows = 0
+            total_inserted_rows = 0
+            total_skipped_duplicates = 0
+            chunk_count = 0
+            rates_payload = None
+            rates = None
 
-            logger.info("Fetched source orders: rows=%s", len(source_orders))
+            while True:
+                source_orders = fetch_source_orders_chunk(
+                    source_connection,
+                    last_created_at,
+                    last_order_id,
+                    SYNC_CHUNK_SIZE,
+                )
 
-            if not source_orders:
-                logger.info("No source orders to process.")
-                return
+                if not source_orders:
+                    break
 
-            source_currencies = sorted({row[4] for row in source_orders})
+                if rates is None:
+                    rates_payload = fetch_latest_rates()
+                    rates = rates_payload["rates"]
 
-            logger.info(
-                "Fetching exchange rates for source currencies: currencies=%s",
-                ",".join(source_currencies),
-            )
+                    logger.info(
+                        "Exchange rates loaded: base=%s timestamp=%s "
+                        "rates_count=%s eur_rate=%s",
+                        rates_payload["base"],
+                        rates_payload["timestamp"],
+                        len(rates),
+                        rates["EUR"],
+                    )
 
-            rates_payload = fetch_latest_rates(required_currencies=source_currencies)
-            rates = rates_payload["rates"]
+                converted_rows = build_converted_rows(source_orders, rates)
+                inserted_rows = insert_converted_orders(
+                    target_connection,
+                    converted_rows,
+                )
 
-            logger.info(
-                "Exchange rates loaded: base=%s timestamp=%s rates_count=%s eur_rate=%s",
-                rates_payload["base"],
-                rates_payload["timestamp"],
-                len(rates),
-                rates["EUR"],
-            )
+                last_order = source_orders[-1]
+                last_created_at = last_order[5]
+                last_order_id = last_order[0]
+                update_sync_state(target_connection, last_created_at, last_order_id)
+                target_connection.commit()
 
-            converted_rows = build_converted_rows(source_orders, rates)
+                skipped_duplicates = len(converted_rows) - inserted_rows
+                chunk_count += 1
+                total_fetched_rows += len(source_orders)
+                total_converted_rows += len(converted_rows)
+                total_inserted_rows += inserted_rows
+                total_skipped_duplicates += skipped_duplicates
 
-            inserted_rows = insert_converted_orders(
-                target_connection,
-                converted_rows,
-            )
+                logger.info(
+                    "Processed orders sync chunk: chunk=%s fetched_rows=%s "
+                    "converted_rows=%s inserted_rows=%s skipped_duplicates=%s "
+                    "last_created_at=%s last_order_id=%s",
+                    chunk_count,
+                    len(source_orders),
+                    len(converted_rows),
+                    inserted_rows,
+                    skipped_duplicates,
+                    last_created_at,
+                    last_order_id,
+                )
 
-            target_connection.commit()
-
-            skipped_duplicates = len(converted_rows) - inserted_rows
             duration_seconds = (
                 datetime.now(timezone.utc) - started_at
             ).total_seconds()
 
             logger.info(
-                "Finished orders sync: fetched_rows=%s converted_rows=%s "
+                "Finished orders sync: chunks=%s fetched_rows=%s converted_rows=%s "
                 "inserted_rows=%s skipped_duplicates=%s duration_seconds=%.2f",
-                len(source_orders),
-                len(converted_rows),
-                inserted_rows,
-                skipped_duplicates,
+                chunk_count,
+                total_fetched_rows,
+                total_converted_rows,
+                total_inserted_rows,
+                total_skipped_duplicates,
                 duration_seconds,
             )
 
         except Exception:
             target_connection.rollback()
+            source_connection.rollback()
             logger.exception("Orders sync failed.")
             raise
         finally:

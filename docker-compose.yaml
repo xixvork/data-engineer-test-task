@@ -1,12 +1,11 @@
 x-airflow-common: &airflow-common
-  image: apache/airflow:2.10.5
+  build: .
   environment:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
-
-    _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary requests"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
 
     OPENEXCHANGE_APP_ID: ${OPENEXCHANGE_APP_ID:-}
 

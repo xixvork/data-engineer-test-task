@@ -4,23 +4,12 @@ from decimal import Decimal, ROUND_HALF_UP
 
 import requests
 
+from common.constants import SUPPORTED_CURRENCIES
+
 
 logger = logging.getLogger(__name__)
 
 OPENEXCHANGE_LATEST_URL = "https://openexchangerates.org/api/latest.json"
-
-DEFAULT_REQUIRED_CURRENCIES = [
-    "USD",
-    "EUR",
-    "GBP",
-    "UAH",
-    "PLN",
-    "CAD",
-    "AUD",
-    "CHF",
-    "JPY",
-    "CZK",
-]
 
 
 def get_openexchange_app_id() -> str:
@@ -37,7 +26,7 @@ def get_openexchange_app_id() -> str:
 def fetch_latest_rates(required_currencies=None) -> dict:
     app_id = get_openexchange_app_id()
 
-    requested_currencies = set(required_currencies or DEFAULT_REQUIRED_CURRENCIES)
+    requested_currencies = set(required_currencies or SUPPORTED_CURRENCIES)
     requested_currencies.add("EUR")
 
     params = {

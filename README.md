@@ -14,14 +14,19 @@ Local Apache Airflow project that generates order data into one PostgreSQL datab
 
 ```text
 .
+├── Dockerfile
 ├── docker-compose.yaml
 ├── .env.example
+├── requirements.txt
 ├── README.md
 └── dags/
     ├── generate_orders_dag.py
     ├── sync_orders_to_eur_dag.py
     └── common/
         ├── __init__.py
+        ├── constants.py
+        ├── db.py
+        ├── schemas.py
         └── exchange_rates.py
 ```
 
@@ -29,15 +34,15 @@ Local Apache Airflow project that generates order data into one PostgreSQL datab
 
 ### `generate_orders_dag`
 
-Runs every 10 minutes.
-
-Generates 5000 new rows into:
+Runs every 10 minutes. It creates the source table if needed and generates 5000 new rows into:
 
 ```text
 postgres-1.orders
 ```
 
-Generated columns:
+Generated rows use `TIMESTAMPTZ` timestamps and include `batch_id` for debugging each insert batch.
+
+Source columns:
 
 ```text
 order_id
@@ -51,15 +56,13 @@ batch_id
 
 ### `sync_orders_to_eur_dag`
 
-Runs every hour.
-
-Reads orders from:
+Runs every hour. It creates target tables if needed, reads source orders incrementally in chunks, and stores cursor progress in:
 
 ```text
-postgres-1.orders
+postgres-2.sync_state
 ```
 
-Converts amounts to EUR using OpenExchangeRates and writes results into:
+It converts amounts to EUR using OpenExchangeRates once per DAG run and writes results into:
 
 ```text
 postgres-2.orders_eur
@@ -79,7 +82,14 @@ source_created_at
 processed_at
 ```
 
-The sync is idempotent: repeated runs do not duplicate rows because `order_id` is used as the primary key.
+The sync is idempotent: repeated runs do not duplicate rows because `orders_eur.order_id` is the primary key and inserts use `ON CONFLICT DO NOTHING`.
+
+## Design Notes
+
+- `sync_state` stores the last processed `(created_at, order_id)` cursor so the hourly sync does not need to rescan the whole source table or rely on `MAX(source_created_at)`.
+- `orders_eur` keeps original amount, original currency, converted EUR amount, and the exchange rate so converted values are auditable.
+- `TIMESTAMPTZ` is used for timestamps so generated and processed times keep timezone meaning across Airflow, PostgreSQL, and local machines.
+- `Dockerfile` and `requirements.txt` install pinned Python dependencies at image build time instead of using `_PIP_ADDITIONAL_REQUIREMENTS` during container startup.
 
 ## Requirements
 
@@ -155,6 +165,48 @@ docker compose exec -T airflow-scheduler airflow dags trigger sync_orders_to_eur
 
 You can also trigger both DAGs from the Airflow UI.
 
+## Smoke Tests
+
+Validate Docker Compose and Python syntax:
+
+```bash
+docker compose config
+python -m py_compile dags/generate_orders_dag.py dags/sync_orders_to_eur_dag.py dags/common/exchange_rates.py dags/common/constants.py dags/common/db.py dags/common/schemas.py
+```
+
+Build and start services:
+
+```bash
+docker compose up -d --build
+```
+
+Check that Airflow can see the DAGs:
+
+```bash
+docker compose exec -T airflow-scheduler airflow dags list
+```
+
+The Compose configuration asks Airflow to create DAGs unpaused. If you reuse existing Airflow metadata and the DAGs are still paused, unpause them manually:
+
+```bash
+docker compose exec -T airflow-scheduler airflow dags unpause generate_orders_dag
+docker compose exec -T airflow-scheduler airflow dags unpause sync_orders_to_eur_dag
+```
+
+Trigger both DAGs:
+
+```bash
+docker compose exec -T airflow-scheduler airflow dags trigger generate_orders_dag
+docker compose exec -T airflow-scheduler airflow dags trigger sync_orders_to_eur_dag
+```
+
+Inspect DAG run states:
+
+```bash
+docker compose exec -T airflow-scheduler airflow dags list-runs -d generate_orders_dag
+docker compose exec -T airflow-scheduler airflow dags list-runs -d sync_orders_to_eur_dag
+```
+
 ## Check Source Database
 
 Connect to `postgres-1`:
@@ -185,6 +237,8 @@ One-line check:
 docker exec -it postgres-1 psql -U postgres -d orders_source -c "SELECT COUNT(*) FROM orders;"
 ```
 
+After one generation run, there should be at least 5000 rows. If the scheduled DAG also ran, the count may be 10000 or more.
+
 ## Check Target Database
 
 Connect to `postgres-2`:
@@ -207,6 +261,7 @@ One-line check:
 
 ```bash
 docker exec -it postgres-2 psql -U postgres -d orders_target -c "SELECT COUNT(*) FROM orders_eur;"
+docker exec -it postgres-2 psql -U postgres -d orders_target -c "SELECT * FROM sync_state;"
 ```
 
 ## Expected Flow
@@ -214,7 +269,7 @@ docker exec -it postgres-2 psql -U postgres -d orders_target -c "SELECT COUNT(*)
 1. Start Docker Compose.
 2. Open Airflow UI.
 3. Trigger `generate_orders_dag`.
-4. Check that `postgres-1.orders` contains 5000 rows.
+4. Check that `postgres-1.orders` contains at least 5000 rows.
 5. Trigger `sync_orders_to_eur_dag`.
 6. Check that `postgres-2.orders_eur` contains converted rows.
 7. Trigger `sync_orders_to_eur_dag` again.
@@ -241,6 +296,17 @@ docker compose down -v
 ```
 
 Use `down -v` only if you want to reset all local data.
+
+## Reset Local Data After Schema Changes
+
+Because the schemas changed from `TIMESTAMP` to `TIMESTAMPTZ`, existing Docker volumes may still contain old tables. For a clean local test, run:
+
+```bash
+docker compose down -v
+docker compose up -d --build
+```
+
+`docker compose down -v` deletes local database data.
 
 ## Notes
 

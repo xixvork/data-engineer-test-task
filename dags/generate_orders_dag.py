@@ -1,60 +1,19 @@
 import logging
-import os
 import random
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pendulum
-import psycopg2
 from psycopg2.extras import execute_values
 
 from airflow.decorators import dag, task
 
+from common.constants import INSERT_PAGE_SIZE, ROWS_PER_BATCH, SUPPORTED_CURRENCIES
+from common.db import get_source_connection
+from common.schemas import create_orders_table
 
 logger = logging.getLogger(__name__)
-
-ROWS_PER_BATCH = 5000
-
-CURRENCIES = [
-    "USD",
-    "EUR",
-    "GBP",
-    "UAH",
-    "PLN",
-    "CAD",
-    "AUD",
-    "CHF",
-    "JPY",
-    "CZK",
-]
-
-
-def get_postgres_1_connection():
-    return psycopg2.connect(
-        host=os.environ["POSTGRES_1_HOST"],
-        port=int(os.environ["POSTGRES_1_PORT"]),
-        dbname=os.environ["POSTGRES_1_DB"],
-        user=os.environ["POSTGRES_1_USER"],
-        password=os.environ["POSTGRES_1_PASSWORD"],
-    )
-
-
-def create_orders_table(connection):
-    create_table_sql = """
-        CREATE TABLE IF NOT EXISTS orders (
-            order_id UUID PRIMARY KEY,
-            customer_email TEXT NOT NULL,
-            order_date TIMESTAMP NOT NULL,
-            amount NUMERIC(12, 2) NOT NULL,
-            currency TEXT NOT NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT now(),
-            batch_id UUID NOT NULL
-        );
-    """
-
-    with connection.cursor() as cursor:
-        cursor.execute(create_table_sql)
 
 
 def generate_random_order(batch_id, now):
@@ -72,14 +31,14 @@ def generate_random_order(batch_id, now):
         customer_email,
         order_date,
         amount,
-        random.choice(CURRENCIES),
+        random.choice(SUPPORTED_CURRENCIES),
         str(batch_id),
     )
 
 
 def generate_orders_batch():
     batch_id = uuid.uuid4()
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = datetime.now(timezone.utc)
 
     rows = [
         generate_random_order(batch_id=batch_id, now=now)
@@ -121,7 +80,7 @@ def insert_orders(connection, batch_id, rows):
     """
 
     with connection.cursor() as cursor:
-        execute_values(cursor, insert_sql, rows, page_size=1000)
+        execute_values(cursor, insert_sql, rows, page_size=INSERT_PAGE_SIZE)
 
         cursor.execute(
             "SELECT COUNT(*) FROM orders WHERE batch_id = %s;",
@@ -139,6 +98,7 @@ def insert_orders(connection, batch_id, rows):
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
     tags=["orders", "generator", "postgres"],
+    max_active_runs=1,
     default_args={
         "retries": 2,
         "retry_delay": timedelta(minutes=2),
@@ -157,11 +117,15 @@ def generate_orders_dag():
 
         batch_id, rows = generate_orders_batch()
 
-        connection = get_postgres_1_connection()
+        connection = get_source_connection()
 
         try:
             create_orders_table(connection)
             inserted_rows = insert_orders(connection, batch_id, rows)
+            if inserted_rows != ROWS_PER_BATCH:
+                raise ValueError(
+                    f"Expected to insert {ROWS_PER_BATCH} rows, inserted {inserted_rows}"
+                )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -182,11 +146,6 @@ def generate_orders_dag():
             inserted_rows,
             duration_seconds,
         )
-
-        if inserted_rows != ROWS_PER_BATCH:
-            raise ValueError(
-                f"Expected to insert {ROWS_PER_BATCH} rows, inserted {inserted_rows}"
-            )
 
     generate_and_insert_orders()
 
