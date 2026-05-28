@@ -30,7 +30,7 @@ def create_orders_eur_table(connection):
             original_amount NUMERIC(12, 2) NOT NULL,
             original_currency TEXT NOT NULL,
             amount_eur NUMERIC(12, 2) NOT NULL,
-            exchange_rate_to_eur NUMERIC(18, 8) NOT NULL,
+            conversion_rate_to_eur NUMERIC(18, 8) NOT NULL,
             source_created_at TIMESTAMPTZ NOT NULL,
             processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );

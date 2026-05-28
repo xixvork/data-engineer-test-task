@@ -102,7 +102,7 @@ def build_converted_rows(source_orders, rates):
             source_created_at,
         ) = order
 
-        amount_eur, exchange_rate_to_eur = convert_amount_to_eur(
+        amount_eur, conversion_rate_to_eur = convert_amount_to_eur(
             amount=original_amount,
             currency=original_currency,
             rates=rates,
@@ -116,7 +116,7 @@ def build_converted_rows(source_orders, rates):
                 original_amount,
                 original_currency,
                 amount_eur,
-                exchange_rate_to_eur,
+                conversion_rate_to_eur,
                 source_created_at,
             )
         )
@@ -136,7 +136,7 @@ def insert_converted_orders(connection, converted_rows):
             original_amount,
             original_currency,
             amount_eur,
-            exchange_rate_to_eur,
+            conversion_rate_to_eur,
             source_created_at
         )
         VALUES %s

@@ -100,10 +100,10 @@ def convert_amount_to_eur(amount, currency: str, rates: dict) -> tuple[Decimal, 
     amount_eur = amount_decimal / source_rate * eur_rate
     amount_eur = amount_eur.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-    exchange_rate_to_eur = eur_rate / source_rate
-    exchange_rate_to_eur = exchange_rate_to_eur.quantize(
+    conversion_rate_to_eur = eur_rate / source_rate
+    conversion_rate_to_eur = conversion_rate_to_eur.quantize(
         Decimal("0.00000001"),
         rounding=ROUND_HALF_UP,
     )
 
-    return amount_eur, exchange_rate_to_eur
+    return amount_eur, conversion_rate_to_eur

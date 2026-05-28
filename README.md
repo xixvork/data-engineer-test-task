@@ -77,7 +77,7 @@ order_date
 original_amount
 original_currency
 amount_eur
-exchange_rate_to_eur
+conversion_rate_to_eur
 source_created_at
 processed_at
 ```
@@ -87,7 +87,8 @@ The sync is idempotent: repeated runs do not duplicate rows because `orders_eur.
 ## Design Notes
 
 - `sync_state` stores the last processed `(created_at, order_id)` cursor so the hourly sync does not need to rescan the whole source table or rely on `MAX(source_created_at)`.
-- `orders_eur` keeps original amount, original currency, converted EUR amount, and the exchange rate so converted values are auditable.
+- `orders_eur` keeps original amount, original currency, converted EUR amount, and the conversion multiplier so converted values are auditable.
+- `conversion_rate_to_eur` stores the multiplier used to convert one unit of the original currency into EUR.
 - `TIMESTAMPTZ` is used for timestamps so generated and processed times keep timezone meaning across Airflow, PostgreSQL, and local machines.
 - `Dockerfile` and `requirements.txt` install pinned Python dependencies at image build time instead of using `_PIP_ADDITIONAL_REQUIREMENTS` during container startup.
 
@@ -264,7 +265,7 @@ Useful SQL:
 ```sql
 SELECT COUNT(*) FROM orders_eur;
 
-SELECT order_id, original_amount, original_currency, amount_eur, exchange_rate_to_eur
+SELECT order_id, original_amount, original_currency, amount_eur, conversion_rate_to_eur
 FROM orders_eur
 LIMIT 10;
 ```
@@ -325,5 +326,5 @@ docker compose up -d --build
 - `order_date` is generated within the last 7 days.
 - `created_at` is used as the technical timestamp for sync logic.
 - OpenExchangeRates is called once per sync run, not once per row.
-- `orders_eur` keeps the original amount, original currency, converted EUR amount, and exchange rate for easier debugging.
+- `orders_eur` keeps the original amount, original currency, converted EUR amount, and conversion multiplier for easier debugging.
 - `.env` contains secrets and must not be committed.
