@@ -2,10 +2,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import pendulum
-from psycopg2.extras import execute_values
-
 from airflow.decorators import dag, task
-
 from common.constants import INSERT_PAGE_SIZE, SYNC_CHUNK_SIZE, SYNC_STATE_NAME
 from common.db import get_source_connection, get_target_connection
 from common.exchange_rates import convert_amount_to_eur, fetch_latest_rates
@@ -14,7 +11,7 @@ from common.schemas import (
     create_orders_table,
     create_sync_state_table,
 )
-
+from psycopg2.extras import execute_values
 
 logger = logging.getLogger(__name__)
 

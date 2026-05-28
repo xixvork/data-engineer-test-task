@@ -174,6 +174,18 @@ docker compose config
 python -m py_compile dags/generate_orders_dag.py dags/sync_orders_to_eur_dag.py dags/common/exchange_rates.py dags/common/constants.py dags/common/db.py dags/common/schemas.py
 ```
 
+## Development Checks
+
+Install development dependencies and run local checks:
+
+```bash
+python -m pip install -r requirements-dev.txt
+ruff check .
+pytest
+```
+
+GitHub Actions runs syntax checks, ruff, and pytest on push and pull requests.
+
 Build and start services:
 
 ```bash

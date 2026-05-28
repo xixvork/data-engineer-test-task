@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install runtime dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Install development dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Compile DAG files
+        run: >
+          python -m py_compile
+          dags/generate_orders_dag.py
+          dags/sync_orders_to_eur_dag.py
+          dags/common/exchange_rates.py
+          dags/common/constants.py
+          dags/common/db.py
+          dags/common/schemas.py
+
+      - name: Run ruff
+        run: ruff check .
+
+      - name: Run pytest
+        run: pytest

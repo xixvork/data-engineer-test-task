@@ -1,11 +1,10 @@
 import logging
 import os
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 
 import requests
 
 from common.constants import SUPPORTED_CURRENCIES
-
 
 logger = logging.getLogger(__name__)
 

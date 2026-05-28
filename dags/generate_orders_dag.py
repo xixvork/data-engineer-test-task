@@ -5,13 +5,11 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pendulum
-from psycopg2.extras import execute_values
-
 from airflow.decorators import dag, task
-
 from common.constants import INSERT_PAGE_SIZE, ROWS_PER_BATCH, SUPPORTED_CURRENCIES
 from common.db import get_source_connection
 from common.schemas import create_orders_table
+from psycopg2.extras import execute_values
 
 logger = logging.getLogger(__name__)
 
