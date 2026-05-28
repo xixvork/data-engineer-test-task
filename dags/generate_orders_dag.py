@@ -63,7 +63,7 @@ def generate_orders_batch():
     return batch_id, rows
 
 
-def insert_orders(connection, batch_id, rows):
+def insert_orders(connection, rows):
     insert_sql = """
         INSERT INTO orders (
             order_id,
@@ -74,19 +74,19 @@ def insert_orders(connection, batch_id, rows):
             batch_id
         )
         VALUES %s
-        ON CONFLICT (order_id) DO NOTHING;
+        RETURNING order_id;
     """
 
     with connection.cursor() as cursor:
-        execute_values(cursor, insert_sql, rows, page_size=INSERT_PAGE_SIZE)
-
-        cursor.execute(
-            "SELECT COUNT(*) FROM orders WHERE batch_id = %s;",
-            (str(batch_id),),
+        inserted_order_ids = execute_values(
+            cursor,
+            insert_sql,
+            rows,
+            page_size=INSERT_PAGE_SIZE,
+            fetch=True,
         )
-        inserted_rows = cursor.fetchone()[0]
 
-    return inserted_rows
+    return len(inserted_order_ids)
 
 
 @dag(
@@ -119,7 +119,7 @@ def generate_orders_dag():
 
         try:
             create_orders_table(connection)
-            inserted_rows = insert_orders(connection, batch_id, rows)
+            inserted_rows = insert_orders(connection, rows)
             if inserted_rows != ROWS_PER_BATCH:
                 raise ValueError(
                     f"Expected to insert {ROWS_PER_BATCH} rows, inserted {inserted_rows}"

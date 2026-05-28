@@ -203,33 +203,31 @@ def sync_orders_to_eur_dag():
             total_inserted_rows = 0
             total_skipped_duplicates = 0
             chunk_count = 0
-            rates_payload = None
-            rates = None
 
-            while True:
-                source_orders = fetch_source_orders_chunk(
-                    source_connection,
-                    last_created_at,
-                    last_order_id,
-                    SYNC_CHUNK_SIZE,
-                )
+            source_orders = fetch_source_orders_chunk(
+                source_connection,
+                last_created_at,
+                last_order_id,
+                SYNC_CHUNK_SIZE,
+            )
 
-                if not source_orders:
-                    break
+            if not source_orders:
+                logger.info("No source orders to process.")
+                return
 
-                if rates is None:
-                    rates_payload = fetch_latest_rates()
-                    rates = rates_payload["rates"]
+            rates_payload = fetch_latest_rates()
+            rates = rates_payload["rates"]
 
-                    logger.info(
-                        "Exchange rates loaded: base=%s timestamp=%s "
-                        "rates_count=%s eur_rate=%s",
-                        rates_payload["base"],
-                        rates_payload["timestamp"],
-                        len(rates),
-                        rates["EUR"],
-                    )
+            logger.info(
+                "Exchange rates loaded: base=%s timestamp=%s "
+                "rates_count=%s eur_rate=%s",
+                rates_payload["base"],
+                rates_payload["timestamp"],
+                len(rates),
+                rates["EUR"],
+            )
 
+            while source_orders:
                 converted_rows = build_converted_rows(source_orders, rates)
                 inserted_rows = insert_converted_orders(
                     target_connection,
@@ -260,6 +258,13 @@ def sync_orders_to_eur_dag():
                     skipped_duplicates,
                     last_created_at,
                     last_order_id,
+                )
+
+                source_orders = fetch_source_orders_chunk(
+                    source_connection,
+                    last_created_at,
+                    last_order_id,
+                    SYNC_CHUNK_SIZE,
                 )
 
             duration_seconds = (
