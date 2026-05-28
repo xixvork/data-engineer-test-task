@@ -92,6 +92,36 @@ The sync is idempotent: repeated runs do not duplicate rows because `orders_eur.
 - `TIMESTAMPTZ` is used for timestamps so generated and processed times keep timezone meaning across Airflow, PostgreSQL, and local machines.
 - `Dockerfile` and `requirements.txt` install pinned Python dependencies at image build time instead of using `_PIP_ADDITIONAL_REQUIREMENTS` during container startup.
 
+## Design Decisions and Trade-offs
+
+### Why NUMERIC(12, 2) instead of float
+
+The task describes `amount` as a float with 2 decimal places. The implementation stores money as `NUMERIC(12, 2)` in PostgreSQL and uses Python `Decimal` during conversion. This avoids binary floating-point rounding issues for money while still satisfying the requirement that generated amounts have 2 decimal places.
+
+### Why `sync_state` instead of `MAX(source_created_at)`
+
+Using `MAX(source_created_at)` can repeatedly re-read rows when many rows share the same maximum timestamp. That can happen naturally because one generated batch may contain many rows with the same `created_at`. The `sync_state` table stores the exact last processed cursor, which keeps the sync incremental and bounded.
+
+### Why the cursor is `(created_at, order_id)`
+
+`created_at` alone is not unique. Adding `order_id` makes the cursor deterministic when multiple rows have the same timestamp. The source index on `(created_at, order_id)` supports this access pattern.
+
+### Why rates are fetched once per sync run
+
+The sync converts all rows in one run using one rate snapshot from OpenExchangeRates. This avoids one API call per row or per chunk, is friendlier to free-plan rate limits, and keeps all rows processed in one run consistent. A production payment system would usually persist normalized FX rate snapshots separately and link converted rows to the snapshot used.
+
+### Why `ON CONFLICT DO NOTHING` is used in the target
+
+Airflow tasks may be retried or manually triggered more than once. Since `orders_eur.order_id` is the primary key, duplicate sync attempts should not duplicate converted facts. In this implementation, `processed_at` means the first successful target insert time, not the last retry attempt time.
+
+### Production extensions
+
+- Store normalized FX rate snapshots and link converted orders to a rate snapshot id.
+- Use schema migrations instead of lazy `CREATE TABLE IF NOT EXISTS` for long-lived environments.
+- Add Airflow pools for shared external APIs if multiple DAGs call the same provider.
+- Export operational metrics to StatsD, Prometheus, or Grafana.
+- Add integration tests for the full Docker, Airflow, and PostgreSQL path.
+
 ## Requirements
 
 - Docker Desktop
