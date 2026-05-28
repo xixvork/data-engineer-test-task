@@ -236,6 +236,8 @@ docker compose exec -T airflow-scheduler airflow dags unpause generate_orders_da
 docker compose exec -T airflow-scheduler airflow dags unpause sync_orders_to_eur_dag
 ```
 
+Because DAGs are unpaused by default, a fresh Airflow metadata database may start a scheduled run shortly after startup. If you also trigger the generator manually at the same time, the source table may contain more than one 5000-row batch.
+
 Trigger both DAGs:
 
 ```bash
