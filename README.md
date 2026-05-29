@@ -225,7 +225,7 @@ Trigger sync to EUR:
 docker compose exec -T airflow-scheduler airflow dags trigger sync_orders_to_eur_dag
 ```
 
-Optionally check the sync run state:
+Check the sync run state and wait until the latest run is successful:
 
 ```bash
 docker compose exec -T airflow-scheduler airflow dags list-runs -d sync_orders_to_eur_dag
@@ -368,7 +368,7 @@ docker compose up -d --build
 
 ## Notes
 
-- `order_date` is generated within the last 7 days.
+- `order_date` is generated within a rolling 7-day timestamp window.
 - `created_at` is used as the technical timestamp for sync logic.
 - OpenExchangeRates is called once per non-empty sync run, not once per row.
 - `orders_eur` keeps the original amount, original currency, converted EUR amount, and conversion multiplier for easier debugging.
