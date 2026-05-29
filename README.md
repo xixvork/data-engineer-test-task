@@ -1,14 +1,42 @@
-# Junior Data Engineer Test Task
+# Orders Sync Pipeline — Airflow + PostgreSQL + EUR Conversion
 
-Local Apache Airflow project that generates order data into one PostgreSQL database and syncs it into another PostgreSQL database with currency conversion to EUR.
+![CI](https://github.com/xixvork/data-engineer-test-task/actions/workflows/ci.yml/badge.svg)
+
+Airflow-orchestrated pipeline that generates synthetic orders into one PostgreSQL database and syncs them into another with currency conversion to EUR using OpenExchangeRates.
 
 ## Stack
 
-- Apache Airflow
-- PostgreSQL
+- Apache Airflow 2.10.5
+- PostgreSQL 15
+- Python via the Airflow base image
 - Docker Compose
-- Python
 - OpenExchangeRates API
+
+## Architecture
+
+```text
+                 every 10 min
+        ┌────────────────────────────┐
+        │ generate_orders_dag         │
+        │ 5000 synthetic orders       │
+        │ rolling 7-day order_date    │
+        └──────────────┬─────────────┘
+                       │
+                       ▼
+        postgres-1 / orders_source / orders
+                       │
+                       │ cursor-paged read
+                       ▼
+        ┌────────────────────────────┐       one call per non-empty run
+        │ sync_orders_to_eur_dag      │ ───────────────────────────────▶ OpenExchangeRates
+        │ convert to EUR              │
+        │ ON CONFLICT DO NOTHING      │
+        └──────────────┬─────────────┘
+                       │
+                       ▼
+        postgres-2 / orders_target / orders_eur
+        postgres-2 / orders_target / sync_state
+```
 
 ## Project Structure
 
@@ -39,16 +67,13 @@ Local Apache Airflow project that generates order data into one PostgreSQL datab
 └── requirements.txt
 ```
 
-`dags/` contains Airflow DAG definitions and shared runtime modules.
-`tests/` contains unit tests for reusable business logic.
-`.github/workflows/ci.yml` runs automated checks on push and pull requests.
-`requirements-dev.txt` and `pyproject.toml` define local development and CI checks.
+`dags/` contains Airflow DAG definitions and shared runtime modules. `tests/` contains unit tests for reusable conversion logic. `.github/workflows/ci.yml` runs syntax checks, ruff, and pytest on push and pull requests.
 
 ## DAGs
 
 ### `generate_orders_dag`
 
-Runs every 10 minutes. It creates the source table if needed and generates 5000 new rows into:
+Runs every 10 minutes. It creates the source table if needed and writes exactly 5000 generated rows per successful run into:
 
 ```text
 postgres-1 / orders_source / orders
@@ -70,7 +95,7 @@ Source columns:
 
 ### `sync_orders_to_eur_dag`
 
-Runs every hour. It creates target tables if needed, reads source orders incrementally in chunks, and stores cursor progress in:
+Runs at the top of every hour. It creates target tables if needed, reads source orders incrementally in chunks, and stores cursor progress in:
 
 ```text
 postgres-2 / orders_target / sync_state
@@ -92,60 +117,51 @@ Target columns:
 | `original_amount` | `NUMERIC(12, 2)` | Amount before conversion |
 | `original_currency` | `TEXT` | Currency before conversion |
 | `amount_eur` | `NUMERIC(12, 2)` | Converted amount in EUR |
-| `conversion_rate_to_eur` | `NUMERIC(18, 8)` | Multiplier used for conversion to EUR |
+| `conversion_rate_to_eur` | `NUMERIC(18, 8)` | Multiplier used to convert one unit of the original currency into EUR |
 | `source_created_at` | `TIMESTAMPTZ` | Source technical insertion timestamp |
 | `processed_at` | `TIMESTAMPTZ` | Target insertion timestamp |
 
 The sync is idempotent: repeated runs do not duplicate rows because `orders_eur.order_id` is the primary key and inserts use `ON CONFLICT DO NOTHING`.
 
-## Design Notes
-
-- `sync_state` stores the last processed `(created_at, order_id)` cursor so the hourly sync does not need to rescan the whole source table or rely on `MAX(source_created_at)`.
-- `orders_eur` keeps original amount, original currency, converted EUR amount, and the conversion multiplier so converted values are auditable.
-- `conversion_rate_to_eur` stores the multiplier used to convert one unit of the original currency into EUR.
-- `TIMESTAMPTZ` is used for timestamps so generated and processed times keep timezone meaning across Airflow, PostgreSQL, and local machines.
-- `Dockerfile` and `requirements.txt` install pinned Python dependencies at image build time instead of using `_PIP_ADDITIONAL_REQUIREMENTS` during container startup.
-
 ## Design Decisions and Trade-offs
 
-### Why NUMERIC(12, 2) instead of float
+### Money as `NUMERIC(12, 2)`
 
-The task describes `amount` as a float with 2 decimal places. The implementation stores money as `NUMERIC(12, 2)` in PostgreSQL and uses Python `Decimal` during conversion. This avoids binary floating-point rounding issues for money while still satisfying the requirement that generated amounts have 2 decimal places.
+The task describes `amount` as a float with 2 decimal places. In payment-style data, money should use exact decimal arithmetic: binary floats can introduce representation errors, for example `0.1 + 0.2 != 0.3`. PostgreSQL `NUMERIC(12, 2)` and Python `Decimal` preserve cent-level precision during conversion and aggregation. The `(12, 2)` precision allows values up to `9,999,999,999.99`, which is far above the generated order range.
 
-### Why `sync_state` instead of `MAX(source_created_at)`
+### Incremental sync cursor
 
-Using `MAX(source_created_at)` can repeatedly re-read rows when many rows share the same maximum timestamp. That can happen naturally because one generated batch may contain many rows with the same `created_at`. The `sync_state` table stores the exact last processed cursor, which keeps the sync incremental and bounded.
+`sync_state` stores the last processed `(created_at, order_id)` cursor. `created_at` alone is not unique because a generated batch can contain many rows with the same technical insertion timestamp; adding `order_id` makes the cursor deterministic and lets the sync continue without rescanning the full source table.
 
-### Why the cursor is `(created_at, order_id)`
+### Target idempotency
 
-`created_at` alone is not unique. Adding `order_id` makes the cursor deterministic when multiple rows have the same timestamp. The source index on `(created_at, order_id)` supports this access pattern.
+`orders_eur` stores original amount, original currency, converted EUR amount, and `conversion_rate_to_eur`, the multiplier used for conversion to EUR. `orders_eur.order_id` is the primary key, and target inserts use `ON CONFLICT DO NOTHING` so Airflow retries or manual reruns do not duplicate converted facts. In this implementation, `processed_at` is the first successful target insert time.
 
-### Why rates are fetched once per non-empty sync run
+### Time and generated dates
 
-The sync converts all rows in one run using one rate snapshot from OpenExchangeRates. This avoids one API call per row or per chunk, is friendlier to free-plan rate limits, and keeps all rows processed in one run consistent. A production payment system would usually persist normalized FX rate snapshots separately and link converted rows to the snapshot used.
+Timestamps use `TIMESTAMPTZ` so generated and processed times keep timezone meaning across Airflow, PostgreSQL, and local machines. The assignment describes the generated order range as `current_date - 7d` to `current_date`; this implementation uses a rolling 7-day timestamp window relative to generation time for a finer-grained datetime distribution.
 
-### Why `order_date` uses a rolling timestamp window
+### Exchange-rate fetches
 
-The assignment describes the range as `current_date - 7d` to `current_date`. This implementation uses a rolling 7-day timestamp window from the current time to produce a finer-grained datetime distribution.
+The sync fetches OpenExchangeRates once per non-empty sync run, after confirming there are pending source rows. This avoids one API call per row or per chunk, is friendlier to free-plan rate limits, and keeps all rows processed in one run consistent.
 
-### Why `ON CONFLICT DO NOTHING` is used in the target
+### Dependency pinning
 
-Airflow tasks may be retried or manually triggered more than once. Since `orders_eur.order_id` is the primary key, duplicate sync attempts should not duplicate converted facts. In this implementation, `processed_at` means the first successful target insert time, not the last retry attempt time.
+Runtime dependencies are pinned in `requirements.txt` and installed at image build time by the `Dockerfile`. Development and CI dependencies are pinned separately in `requirements-dev.txt`.
 
 ### Production extensions
 
-- Store normalized FX rate snapshots and link converted orders to a rate snapshot id.
+- Add an `exchange_rate_snapshots` table with `(snapshot_id, fetched_at, base_currency, rates_jsonb)` and reference it from `orders_eur`. This would make FX conversion auditable at snapshot level and reduce repeated per-row rate metadata.
 - Use schema migrations instead of lazy `CREATE TABLE IF NOT EXISTS` for long-lived environments.
-- Add Airflow pools for shared external APIs if multiple DAGs call the same provider.
-- Export operational metrics to StatsD, Prometheus, or Grafana.
-- Add integration tests for the full Docker, Airflow, and PostgreSQL path.
+- Add integration tests for the Docker, Airflow, PostgreSQL, and OpenExchangeRates path with a mocked FX provider.
+- Export operational metrics for generated rows, synced rows, skipped duplicates, and external API failures.
 
 ## Requirements
 
 For running the project:
 
 - Docker Desktop
-- OpenExchangeRates API key
+- OpenExchangeRates app id
 
 For local development checks:
 
@@ -166,7 +182,9 @@ Open `.env` and set your OpenExchangeRates app id:
 OPENEXCHANGE_APP_ID=your_openexchange_app_id_here
 ```
 
-Do not commit `.env` to Git.
+You can create a free app id at OpenExchangeRates: https://openexchangerates.org/signup/free
+
+Do not commit `.env`; it contains local secrets.
 
 ## Run
 
@@ -195,52 +213,134 @@ username: airflow
 password: airflow
 ```
 
+These credentials are for local development only and must not be used in shared or production environments.
+
 ## Services
 
 ```text
 airflow-webserver   http://localhost:8080
-airflow-scheduler   internal scheduler service
+airflow-scheduler   schedules and runs DAG tasks
 postgres-1          localhost:5433 -> orders_source
 postgres-2          localhost:5434 -> orders_target
-postgres-airflow    internal Airflow metadata database
+postgres-airflow    Airflow metadata DB
 ```
 
 ## Trigger DAGs Manually
 
-Trigger order generation:
+Trigger order generation and check the latest run state:
 
 ```bash
 docker compose exec -T airflow-scheduler airflow dags trigger generate_orders_dag
-```
-
-Check the generator run state and wait until the latest run is successful:
-
-```bash
 docker compose exec -T airflow-scheduler airflow dags list-runs -d generate_orders_dag
 ```
 
-Trigger sync to EUR:
+Trigger sync to EUR after the generator run succeeds:
 
 ```bash
 docker compose exec -T airflow-scheduler airflow dags trigger sync_orders_to_eur_dag
-```
-
-Check the sync run state and wait until the latest run is successful:
-
-```bash
 docker compose exec -T airflow-scheduler airflow dags list-runs -d sync_orders_to_eur_dag
 ```
 
 You can also trigger both DAGs from the Airflow UI.
 
-The Compose configuration asks Airflow to create DAGs unpaused. If you reuse existing Airflow metadata and the DAGs are still paused, unpause them manually after starting the stack:
+The Compose configuration creates DAGs unpaused. With a fresh Airflow metadata database, scheduled runs may start shortly after startup. Each successful generator run creates exactly 5000 rows. The total source row count increases by 5000 per successful generator run; it may already be higher if scheduled runs have also executed.
+
+If reused Airflow metadata still has the DAGs paused, unpause them manually:
 
 ```bash
 docker compose exec -T airflow-scheduler airflow dags unpause generate_orders_dag
 docker compose exec -T airflow-scheduler airflow dags unpause sync_orders_to_eur_dag
 ```
 
-Because DAGs are unpaused by default, a fresh Airflow metadata database may start a scheduled run shortly after startup. If you also trigger the generator manually at the same time, the source table may contain more than one 5000-row batch.
+## Database Connections
+
+Connect to the source database:
+
+```bash
+docker exec -it postgres-1 psql -U postgres -d orders_source
+```
+
+Connect to the target database:
+
+```bash
+docker exec -it postgres-2 psql -U postgres -d orders_target
+```
+
+Quick row-count checks:
+
+```bash
+docker exec -i postgres-1 psql -U postgres -d orders_source -c "SELECT COUNT(*) FROM orders;"
+docker exec -i postgres-2 psql -U postgres -d orders_target -c "SELECT COUNT(*) FROM orders_eur;"
+docker exec -i postgres-2 psql -U postgres -d orders_target -c "SELECT * FROM sync_state;"
+```
+
+## How to verify correctness
+
+Run source checks in `postgres-1 / orders_source`.
+
+Generator creates exactly 5000 rows per batch:
+
+```sql
+SELECT batch_id, COUNT(*)
+FROM orders
+GROUP BY batch_id
+ORDER BY batch_id;
+```
+
+Expected: each `batch_id` should have exactly 5000 rows.
+
+Source order dates are within the rolling 7-day window relative to insert time:
+
+```sql
+SELECT COUNT(*) AS invalid_order_dates
+FROM orders
+WHERE order_date < created_at - interval '7 days'
+   OR order_date > created_at;
+```
+
+Expected: `0`.
+
+Run target checks in `postgres-2 / orders_target`.
+
+Sync is idempotent:
+
+```sql
+SELECT COUNT(*) FROM orders_eur;
+```
+
+Expected: if no new source rows were generated, triggering `sync_orders_to_eur_dag` again should not change this count.
+
+All target rows have converted amounts:
+
+```sql
+SELECT COUNT(*) AS null_converted_amounts
+FROM orders_eur
+WHERE amount_eur IS NULL;
+```
+
+Expected: `0`.
+
+EUR orders preserve the original amount:
+
+```sql
+SELECT COUNT(*) AS changed_eur_rows
+FROM orders_eur
+WHERE original_currency = 'EUR'
+  AND amount_eur != original_amount;
+```
+
+Expected: `0`.
+
+Target currency distribution:
+
+```sql
+SELECT original_currency, COUNT(*)
+FROM orders_eur
+GROUP BY original_currency
+ORDER BY original_currency;
+```
+
+Expected: the result should include currencies generated by the source DAG.
 
 ## Static Checks
 
@@ -263,76 +363,6 @@ pytest
 
 GitHub Actions runs syntax checks, ruff, and pytest on push and pull requests.
 
-## Check Source Database
-
-Connect to `postgres-1`:
-
-```bash
-docker exec -it postgres-1 psql -U postgres -d orders_source
-```
-
-Useful SQL:
-
-```sql
-SELECT COUNT(*) FROM orders;
-
-SELECT batch_id, COUNT(*)
-FROM orders
-GROUP BY batch_id
-ORDER BY COUNT(*) DESC
-LIMIT 10;
-
-SELECT *
-FROM orders
-LIMIT 10;
-```
-
-Quick checks:
-
-```bash
-docker exec -i postgres-1 psql -U postgres -d orders_source -c "SELECT COUNT(*) FROM orders;"
-```
-
-After one generation run, there should be at least 5000 rows. If the scheduled DAG also ran, the count may be 10000 or more.
-
-## Check Target Database
-
-Connect to `postgres-2`:
-
-```bash
-docker exec -it postgres-2 psql -U postgres -d orders_target
-```
-
-Useful SQL:
-
-```sql
-SELECT COUNT(*) FROM orders_eur;
-
-SELECT order_id, original_amount, original_currency, amount_eur, conversion_rate_to_eur
-FROM orders_eur
-LIMIT 10;
-```
-
-Quick checks:
-
-```bash
-docker exec -i postgres-2 psql -U postgres -d orders_target -c "SELECT COUNT(*) FROM orders_eur;"
-docker exec -i postgres-2 psql -U postgres -d orders_target -c "SELECT * FROM sync_state;"
-```
-
-## Expected Flow
-
-1. Start Docker Compose.
-2. Open Airflow UI.
-3. Trigger `generate_orders_dag`.
-4. Wait until the generator run is successful.
-5. Check that `postgres-1 / orders_source / orders` contains at least 5000 rows.
-6. Trigger `sync_orders_to_eur_dag`.
-7. Wait until the sync run is successful.
-8. Check that `postgres-2 / orders_target / orders_eur` contains converted rows.
-9. Trigger `sync_orders_to_eur_dag` again.
-10. Check that row count in `orders_eur` does not double.
-
 ## Stop Services
 
 Stop containers but keep data:
@@ -354,22 +384,3 @@ docker compose down -v
 ```
 
 Use `down -v` only if you want to reset all local data.
-
-## Reset Local Data
-
-If local Docker volumes contain an older schema or stale test data, reset them before a clean test run:
-
-```bash
-docker compose down -v
-docker compose up -d --build
-```
-
-`docker compose down -v` deletes local database data.
-
-## Notes
-
-- `order_date` is generated within a rolling 7-day timestamp window.
-- `created_at` is used as the technical timestamp for sync logic.
-- OpenExchangeRates is called once per non-empty sync run, not once per row.
-- `orders_eur` keeps the original amount, original currency, converted EUR amount, and conversion multiplier for easier debugging.
-- `.env` contains secrets and must not be committed.
